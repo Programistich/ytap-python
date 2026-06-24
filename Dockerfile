@@ -15,7 +15,13 @@ RUN apt-get update && apt-get install -y curl unzip &&  \
     rm -rf /var/lib/apt/lists/* &&  \
     pip install -r requirements.txt &&  \
     groupadd -g 10000 nonroot && \
-    useradd -u 10000 -g 10000 -s /bin/bash -m nonroot
+    useradd -u 10000 -g 10000 -s /bin/bash -m nonroot && \
+    mkdir -p /data && chown 10000:10000 /data
+
+# Persistent cookies live here (named volume in compose). Creating it owned by
+# nonroot means the volume inherits that ownership on first mount, so the
+# non-root process can write refreshed / chat-uploaded cookies.
+VOLUME ["/data"]
 
 # yt-dlp drives deno (its JS runtime) to solve YouTube's player JS challenge.
 # deno needs a writable cache dir; /tmp is writable for the nonroot user.

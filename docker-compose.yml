@@ -11,10 +11,16 @@ services:
     env_file:
       - .env
     volumes:
-      # YouTube cookies to bypass the datacenter-IP bot check.
-      # Create ./cookies.txt before `up`; it is gitignored.
+      # Bootstrap cookies, read-only. Used only to seed the persistent volume
+      # the first time. Create ./cookies.txt before `up`; it is gitignored.
       - ./cookies.txt:/app/cookies.txt:ro
+      # Persistent working cookies: yt-dlp's refreshed cookies and any uploaded
+      # via chat survive container restarts/rebuilds here.
+      - cookies-data:/data
     depends_on:
       - bgutil-provider
     container_name: ytap-python
     restart: always
+
+volumes:
+  cookies-data:
