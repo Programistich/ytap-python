@@ -1,21 +1,47 @@
 #!/usr/bin/env python3
 
+import asyncio
+import datetime
+import glob
+import json
 import logging
+import os
 import random
 import string
 import subprocess
-import telegram
-import os
-import json
-import datetime
+from urllib.parse import urlparse
 
-from time import sleep
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    filters,
+)
 
 logging.basicConfig(
     level=logging.INFO, format="%(asctime)s - %(name)s - %(levelname)s - %(message)s"
 )
 
-TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.environ["BOT_TOKEN"]  # fail fast with a clear KeyError if unset
+
+# Telegram doesn't support media files > 50 MB for bots to send.
+MAX_TELEGRAM_AUDIO_MB = 50
+# Target size per chunk when splitting a large file (leaves headroom below 50 MB).
+TARGET_CHUNK_MB = 45
+# Telegram caps the audio "title" field at 64 characters.
+MAX_TITLE_LEN = 64
+
+# Only hosts in this set are accepted. Using urlparse + an exact host match
+# prevents both command injection (no shell, validated input) and spoofing
+# such as "https://youtu.be.evil.com" that a substring check would allow.
+ALLOWED_HOSTS = {
+    "youtube.com",
+    "www.youtube.com",
+    "m.youtube.com",
+    "youtu.be",
+}
 
 START_MESSAGE = """
 Hi! Just send me a youtube link and I'll send you an audio from it.
@@ -31,88 +57,76 @@ def id_generator(size=6, chars=string.ascii_uppercase + string.digits):
     return "".join(random.choice(chars) for _ in range(size))
 
 
-def download_video(id, url):
-    """
-    Download video in the worst possible format and get video name
-    :param url: youtube video url
-    :param id: generated id for a file
-    :return: name of the video
-    """
-    video_filename = f"/tmp/video-{id}.mp4"
-    cmd_download = f"yt-dlp --newline -f bestaudio[ext=m4a] {url} -o {video_filename}"
-    cmd_name = f"yt-dlp --skip-download --get-title --no-warnings {url}"
-    try:
-        code = subprocess.run(cmd_download.split())
-        video_name = subprocess.run(
-            cmd_name, capture_output=True, text=True, shell=True
-        )
-        logging.info(f"video_name")
-        code.check_returncode()
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Something went wrong with downloading video: {e}")
-        return "fail"
-    return video_name.stdout.strip()
-
-
-def get_audio_from_video(id):
-    """
-    Extract audio with ffmpeg
-    """
-    audio_filename = f"/tmp/audio-{id}.mp3"
-    cmd = f"ffmpeg -i /tmp/video-{id}.mp4 -q:a 0 -af dynaudnorm -map a {audio_filename}"
-    try:
-        code = subprocess.run(cmd.split())
-        exit_code = code.returncode
-    except subprocess.CalledProcessError as e:
-        logging.error(f"Something went wrong with getting audio from video: {e}")
-        return "fail", "fail"
-    return exit_code, audio_filename
-
-
-def graceful_fail(bot, message_id, user_id):
-    bot.send_message(
-        user_id,
-        f"Couldn't download this video, sorry",
-    )
-    bot.get_updates(offset=message_id + 1)
-
-
-def cleanup(id):
-    """
-    Remove temp audio and video files
-    """
-    video_filename = f"/tmp/video-{id}.mp4"
-    audio_filename = f"/tmp/audio-{id}.mp3"
-    if os.path.isfile(video_filename) and os.path.isfile(audio_filename):
-        os.remove(video_filename)
-        os.remove(audio_filename)
-    else:
-        logging.error(f"Error: couldn't find audio/video file")
-
-
 def is_youtube_url(text):
     """
-    Checks that text contains a youtube link
+    Checks that text is a URL pointing at an allowed YouTube host.
     :param text: any text
     """
-    youtube_links = [
-        "https://www.youtube.com",
-        "https://m.youtube.com",
-        "https://youtu.be",
-    ]
-    return any(youtube_link in text for youtube_link in youtube_links)
+    try:
+        parsed = urlparse(text.strip())
+    except (ValueError, AttributeError):
+        return False
+    return parsed.scheme in ("http", "https") and parsed.netloc in ALLOWED_HOSTS
 
 
 def trim_link(link):
     """
     Trims link to get direct link to the video
-    Reason: If the link contains list id of playlist youtube-dl will download parts of it
+    Reason: If the link contains list id of playlist yt-dlp will download parts of it
     :param link: youtube link
     """
     return link.split("&")[0]
 
 
-def calculate_file_size(filepath: str) -> int:
+def download_video(id, url):
+    """
+    Download best audio stream and fetch the video title.
+    Arguments are passed as an argv list (no shell) so user-supplied URLs
+    cannot inject commands.
+    :param url: youtube video url
+    :param id: generated id for a file
+    :return: title of the video, or None on failure
+    """
+    video_filename = f"/tmp/video-{id}.mp4"
+    try:
+        download = subprocess.run(
+            ["yt-dlp", "--newline", "-f", "bestaudio[ext=m4a]", url, "-o", video_filename]
+        )
+        download.check_returncode()
+        title_proc = subprocess.run(
+            ["yt-dlp", "--skip-download", "--get-title", "--no-warnings", url],
+            capture_output=True,
+            text=True,
+        )
+        title_proc.check_returncode()
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Something went wrong with downloading video: {e}")
+        return None
+    title = title_proc.stdout.strip()[:MAX_TITLE_LEN]
+    logging.info(f"video title: {title}")
+    return title
+
+
+def get_audio_from_video(id):
+    """
+    Extract audio with ffmpeg.
+    :return: path to the audio file, or None on failure
+    """
+    audio_filename = f"/tmp/audio-{id}.mp3"
+    video_filename = f"/tmp/video-{id}.mp4"
+    try:
+        code = subprocess.run(
+            ["ffmpeg", "-i", video_filename, "-q:a", "0", "-af", "dynaudnorm",
+             "-map", "a", audio_filename]
+        )
+        code.check_returncode()
+    except subprocess.CalledProcessError as e:
+        logging.error(f"Something went wrong with getting audio from video: {e}")
+        return None
+    return audio_filename
+
+
+def calculate_file_size(filepath: str) -> float:
     """
     Returns filesize in MB
     :param filepath: path to file
@@ -122,107 +136,134 @@ def calculate_file_size(filepath: str) -> int:
 
 def get_audio_duration(audiofile):
     """
-    Returns duration of audiofile
+    Returns duration of audiofile in seconds, or None on failure.
     :param audiofile: path to audiofile
     """
-    cmd = f"ffprobe -v quiet -print_format json -show_format -show_streams -print_format json {audiofile} | tr -d '\n'"
     try:
-        full_audio_info_raw = subprocess.run(
-            cmd, capture_output=True, text=True, shell=True
+        proc = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json",
+             "-show_format", "-show_streams", audiofile],
+            capture_output=True,
+            text=True,
         )
-        full_audio_info = json.loads(full_audio_info_raw.stdout)
+        proc.check_returncode()
+        full_audio_info = json.loads(proc.stdout)
         duration = full_audio_info["format"]["duration"]
-    except Exception as e:
-        logging.error(f"Something went wrong with getting audio from video: {e}")
-        exit(1)
+    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        logging.error(f"Something went wrong with reading audio duration: {e}")
+        return None
     return int(float(duration))
 
 
 def divide_audio_into_parts(number_of_parts, duration, id):
     """
-    Divides audio to several parts depending on duration
-    :param number_of_parts: number of parts the file should be divided
-    :param duration: duration of audio
+    Divides audio into several parts depending on duration.
+    :param number_of_parts: number of parts the file should be divided into
+    :param duration: duration of audio in seconds
     :param id: id of audio file
+    :return: True on success, False otherwise
     """
     duration_of_one_part = duration // number_of_parts
     for i in range(0, number_of_parts):
         t1 = str(datetime.timedelta(seconds=i * int(duration_of_one_part)))
         t2 = str(datetime.timedelta(seconds=(i + 1) * int(duration_of_one_part)))
-        cmd = f"ffmpeg -i /tmp/audio-{id}.mp3 -ss {t1} -to {t2} -c copy /tmp/audio-{id}_part{i}.mp3"
         try:
-            code = subprocess.run(cmd.split())
-        except Exception as e:
+            code = subprocess.run(
+                ["ffmpeg", "-i", f"/tmp/audio-{id}.mp3", "-ss", t1, "-to", t2,
+                 "-c", "copy", f"/tmp/audio-{id}_part{i}.mp3"]
+            )
+            code.check_returncode()
+        except subprocess.CalledProcessError as e:
             logging.error(f"Something went wrong with splitting audio: {e}")
-            exit(1)
+            return False
+    return True
+
+
+def cleanup(id):
+    """
+    Remove every temp file belonging to this id (video, audio and part files).
+    Safe to call even if some files are missing.
+    """
+    for path in glob.glob(f"/tmp/video-{id}*") + glob.glob(f"/tmp/audio-{id}*"):
+        try:
+            os.remove(path)
+        except OSError as e:
+            logging.error(f"Couldn't remove {path}: {e}")
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(START_MESSAGE)
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    message = update.message.text
+    user_id = update.effective_chat.id
+    logging.info(f"User id: {user_id}, message: {message}")
+
+    if not is_youtube_url(message):
+        await update.message.reply_text(
+            f"Couldn't find a youtube link in your message: {message}"
+        )
+        return
+
+    logging.info(f"Got a youtube link {message}")
+    await update.message.reply_text("Preparing video")
+    link = trim_link(message)
+    logging.info(f"Trimmed link to {link}")
+    id = id_generator()
+
+    try:
+        # yt-dlp / ffmpeg are blocking; run them off the event loop so the bot
+        # stays responsive to other users.
+        video_name = await asyncio.to_thread(download_video, id, link)
+        if video_name is None:
+            await update.message.reply_text("Couldn't download this video, sorry")
+            return
+
+        audiofile = await asyncio.to_thread(get_audio_from_video, id)
+        if audiofile is None:
+            await update.message.reply_text("Couldn't download this video, sorry")
+            return
+
+        filesize = calculate_file_size(audiofile)
+        if filesize < MAX_TELEGRAM_AUDIO_MB:
+            with open(audiofile, "rb") as f:
+                await update.message.reply_audio(audio=f, title=video_name)
+            return
+
+        number_of_parts = int(filesize // TARGET_CHUNK_MB + 1)
+        audio_duration = await asyncio.to_thread(get_audio_duration, audiofile)
+        if audio_duration is None:
+            await update.message.reply_text("Couldn't download this video, sorry")
+            return
+
+        ok = await asyncio.to_thread(
+            divide_audio_into_parts, number_of_parts, audio_duration, id
+        )
+        if not ok:
+            await update.message.reply_text("Couldn't download this video, sorry")
+            return
+
+        await update.message.reply_text(
+            "Sending several files. Start playing them from the last one"
+        )
+        # Send in reverse order: telegram plays audio from the bottom up.
+        for i in range((number_of_parts - 1), -1, -1):
+            with open(f"/tmp/audio-{id}_part{i}.mp3", "rb") as f:
+                await update.message.reply_audio(audio=f, title=video_name)
+    except Exception as e:
+        logging.exception(f"Failed to process {link}: {e}")
+        await update.message.reply_text("Couldn't download this video, sorry")
+    finally:
+        cleanup(id)
 
 
 def main():
-    logging.info(f"YTAP-Bot has started")
-    bot = telegram.Bot(TOKEN)
-    message_id = 0
-    while True:
-        updates = bot.get_updates(offset=1)
-        for i in range(0, len(updates)):
-            user_id = updates[i]["message"]["chat"]["id"]
-            message_id = updates[i]["update_id"]
-            message = updates[i]["message"]["text"]
-            print(f"User id: {user_id}, message: {message}, message id: {message_id}")
-            if message in "/start":
-                bot.send_message(user_id, START_MESSAGE)
-            if is_youtube_url(message):
-                logging.info(f"Got a youtube link {message}")
-                bot.send_message(user_id, "Preparing video")
-                link = trim_link(message)
-                logging.info(f"Trimmed link to {link}")
-                id = id_generator()
-                video_name = download_video(id, link)
-                if video_name == "fail":
-                    logging.error("video_name failed")
-                    graceful_fail(bot, message_id, user_id)
-                    continue
-                audiofile = f"/tmp/audio-{id}.mp3"
-                audio_result = get_audio_from_video(id)
-                logging.info(f"audio result: {audio_result}")
-                if audio_result[0] == "fail":
-                    logging.error("get_audio_from_video failed")
-                    graceful_fail(bot, message_id, user_id)
-                    continue
-                # Telegram doesn't support media files > 50 MB for bots to send
-                filesize = calculate_file_size(audiofile)
-                if filesize < 50:
-                    bot.send_audio(
-                        user_id,
-                        audio=open(f"/tmp/audio-{id}.mp3", "rb"),
-                        title=video_name,
-                    )
-                else:
-                    number_of_parts = int(filesize // 45 + 1)
-                    audio_duration = get_audio_duration(audiofile)
-                    divide_audio_into_parts(number_of_parts, audio_duration, id)
-                    bot.send_message(
-                        user_id,
-                        f"Sending several files. Start playing them from the last one",
-                    )
-                    # Sending file in reverse order, because telegram plays audio from the bottom up
-                    for i in range((number_of_parts - 1), -1, -1):
-                        bot.send_audio(
-                            user_id,
-                            audio=open(f"/tmp/audio-{id}_part{i}.mp3", "rb"),
-                            title=video_name,
-                        )
-                cleanup(id)
-            else:
-                if message in "/start":
-                    continue
-                bot.send_message(
-                    user_id,
-                    f"Couldn't find a youtube link in your message: {message}",
-                )
-                logging.info(f"Got a message: {message}")
-        if message_id:
-            updates = bot.get_updates(offset=message_id + 1)
-        sleep(60)
+    logging.info("YTAP-Bot has started")
+    app = Application.builder().token(TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
 
 if __name__ == "__main__":
