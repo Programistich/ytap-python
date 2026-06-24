@@ -5,8 +5,6 @@ WORKDIR /app
 COPY requirements.txt /app/requirements.txt
 
 RUN apt-get update && apt-get install -y curl unzip &&  \
-    curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp &&  \
-    chmod a+rx /usr/local/bin/yt-dlp &&  \
     curl -L https://github.com/denoland/deno/releases/latest/download/deno-x86_64-unknown-linux-gnu.zip -o /tmp/deno.zip && \
     unzip /tmp/deno.zip -d /usr/local/bin && \
     chmod a+rx /usr/local/bin/deno && \

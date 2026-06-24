@@ -1,4 +1,11 @@
 services:
+  bgutil-provider:
+    # PO Token provider: yt-dlp fetches GVS PO tokens from here so YouTube
+    # media downloads from a datacenter IP don't get HTTP 403.
+    image: brainicism/bgutil-ytdlp-pot-provider
+    container_name: bgutil-provider
+    restart: always
+
   ytap-python:
     build: .
     env_file:
@@ -7,5 +14,7 @@ services:
       # YouTube cookies to bypass the datacenter-IP bot check.
       # Create ./cookies.txt before `up`; it is gitignored.
       - ./cookies.txt:/app/cookies.txt:ro
+    depends_on:
+      - bgutil-provider
     container_name: ytap-python
     restart: always

@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import random
+import shutil
 import string
 import subprocess
 from urllib.parse import urlparse
@@ -34,18 +35,42 @@ TARGET_CHUNK_MB = 45
 MAX_TITLE_LEN = 64
 
 # Optional cookies file to get past YouTube's "confirm you're not a bot" check
-# when running from a datacenter IP. Passed to yt-dlp only if the file exists,
-# so the bot still works without it.
+# when running from a datacenter IP. Passed to yt-dlp only if present, so the
+# bot still works without it.
 COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+# yt-dlp rewrites refreshed cookies back to the file on exit; the mounted
+# COOKIES_FILE is read-only, so we work off a writable copy in /tmp.
+WORK_COOKIES_FILE = "/tmp/cookies.txt"
+# bgutil PO Token provider (separate container). yt-dlp fetches GVS PO tokens
+# from here; without them YouTube media downloads from a datacenter IP get a
+# HTTP 403. Empty string disables it.
+POT_PROVIDER_URL = os.getenv("POT_PROVIDER_URL", "http://bgutil-provider:4416")
+
+
+def prepare_cookies():
+    """
+    Copy the (read-only) mounted cookies file to a writable location once at
+    startup so yt-dlp can update it without hitting a read-only filesystem.
+    """
+    if os.path.isfile(COOKIES_FILE):
+        try:
+            shutil.copyfile(COOKIES_FILE, WORK_COOKIES_FILE)
+            logging.info(f"Cookies ready at {WORK_COOKIES_FILE}")
+        except OSError as e:
+            logging.error(f"Couldn't prepare cookies file: {e}")
 
 
 def ytdlp_cmd(*args):
     """
-    Build a yt-dlp argv list, adding --cookies when a cookies file is present.
+    Build a yt-dlp argv list, adding --cookies and the PO token provider URL
+    when they are available.
     """
     cmd = ["yt-dlp"]
-    if os.path.isfile(COOKIES_FILE):
-        cmd += ["--cookies", COOKIES_FILE]
+    if os.path.isfile(WORK_COOKIES_FILE):
+        cmd += ["--cookies", WORK_COOKIES_FILE]
+    if POT_PROVIDER_URL:
+        cmd += ["--extractor-args",
+                f"youtubepot-bgutilhttp:base_url={POT_PROVIDER_URL}"]
     cmd += list(args)
     return cmd
 
@@ -276,6 +301,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def main():
     logging.info("YTAP-Bot has started")
+    prepare_cookies()
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
