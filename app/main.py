@@ -33,6 +33,22 @@ TARGET_CHUNK_MB = 45
 # Telegram caps the audio "title" field at 64 characters.
 MAX_TITLE_LEN = 64
 
+# Optional cookies file to get past YouTube's "confirm you're not a bot" check
+# when running from a datacenter IP. Passed to yt-dlp only if the file exists,
+# so the bot still works without it.
+COOKIES_FILE = os.getenv("COOKIES_FILE", "/app/cookies.txt")
+
+
+def ytdlp_cmd(*args):
+    """
+    Build a yt-dlp argv list, adding --cookies when a cookies file is present.
+    """
+    cmd = ["yt-dlp"]
+    if os.path.isfile(COOKIES_FILE):
+        cmd += ["--cookies", COOKIES_FILE]
+    cmd += list(args)
+    return cmd
+
 # Only hosts in this set are accepted. Using urlparse + an exact host match
 # prevents both command injection (no shell, validated input) and spoofing
 # such as "https://youtu.be.evil.com" that a substring check would allow.
@@ -90,11 +106,11 @@ def download_video(id, url):
     video_filename = f"/tmp/video-{id}.mp4"
     try:
         download = subprocess.run(
-            ["yt-dlp", "--newline", "-f", "bestaudio[ext=m4a]", url, "-o", video_filename]
+            ytdlp_cmd("--newline", "-f", "bestaudio[ext=m4a]", url, "-o", video_filename)
         )
         download.check_returncode()
         title_proc = subprocess.run(
-            ["yt-dlp", "--skip-download", "--get-title", "--no-warnings", url],
+            ytdlp_cmd("--skip-download", "--get-title", "--no-warnings", url),
             capture_output=True,
             text=True,
         )
