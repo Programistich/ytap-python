@@ -34,6 +34,17 @@ TARGET_CHUNK_MB = 45
 # Telegram caps the audio "title" field at 64 characters.
 MAX_TITLE_LEN = 64
 
+# Format selection. YouTube serves direct (DASH/https) audio URLs that a
+# datacenter IP gets HTTP 403 on, while HLS (m3u8) streams still download.
+# So prefer HLS: an audio-only HLS stream if offered, otherwise the smallest
+# HLS variant that carries audio (ffmpeg extracts the audio anyway). Fall back
+# to plain bestaudio for environments where direct URLs aren't blocked.
+YTDLP_FORMAT = (
+    "bestaudio[protocol*=m3u8]/"
+    "worst[protocol*=m3u8][acodec!=none]/"
+    "bestaudio[ext=m4a]/bestaudio"
+)
+
 # Optional cookies file to get past YouTube's "confirm you're not a bot" check
 # when running from a datacenter IP. Passed to yt-dlp only if present, so the
 # bot still works without it.
@@ -131,7 +142,7 @@ def download_video(id, url):
     video_filename = f"/tmp/video-{id}.mp4"
     try:
         download = subprocess.run(
-            ytdlp_cmd("--newline", "-f", "bestaudio[ext=m4a]", url, "-o", video_filename)
+            ytdlp_cmd("--newline", "-f", YTDLP_FORMAT, url, "-o", video_filename)
         )
         download.check_returncode()
         title_proc = subprocess.run(
