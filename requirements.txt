@@ -1,3 +1,5 @@
 python-telegram-bot==21.10
-yt-dlp
+# [default] bundles yt-dlp-ejs so the YouTube nsig JS solver ships in the
+# image (run by deno) — no runtime download of remote components needed.
+yt-dlp[default]
 bgutil-ytdlp-pot-provider
